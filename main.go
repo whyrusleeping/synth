@@ -1,19 +1,18 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
-	"math/cmplx"
+	"math/rand"
 	"os"
+	"runtime/pprof"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gopxl/beep"
 	"github.com/gopxl/beep/speaker"
-	"github.com/maddyblue/go-dsp/fft"
 	"github.com/rakyll/portmidi"
-	"github.com/veandco/go-sdl2/sdl"
 )
 
 type OscFunc func(float64) float64
@@ -22,6 +21,13 @@ const (
 	sampleRate = 44100
 	duration   = 2
 )
+
+var sr = beep.SampleRate(sampleRate)
+
+type Filter interface {
+	ProcessSample(samples [][2]float64)
+	GetSetter(k string) func(float64)
+}
 
 type Recorder struct {
 	lk       sync.Mutex
@@ -68,6 +74,37 @@ func (r *Recorder) GetSnapshot(buf [][2]float64) int {
 
 func (r *Recorder) Err() error {
 	return nil
+}
+
+func MulMix(a, b beep.Streamer) beep.StreamerFunc {
+	abuf := make([][2]float64, 512)
+	bbuf := make([][2]float64, 512)
+	return func(samples [][2]float64) (int, bool) {
+		olen := len(samples)
+		for len(samples) > 0 {
+			n := len(abuf)
+			if n > len(samples) {
+				n = len(samples)
+			}
+			an, aok := a.Stream(abuf[:n])
+			bn, bok := b.Stream(bbuf[:n])
+
+			if an != bn {
+				panic("not dealing with this yet")
+			}
+			if !aok || !bok {
+				panic("not dealing with this yet either")
+			}
+
+			for i := 0; i < n; i++ {
+				samples[i][0] = abuf[i][0] * bbuf[i][0]
+				samples[i][1] = abuf[i][1] * bbuf[i][1]
+			}
+
+			samples = samples[n:]
+		}
+		return olen, true
+	}
 }
 
 type Delay struct {
@@ -188,6 +225,33 @@ func (b *Butterworth) UpdateCutoff(cutoffFreq float64) {
 	b.a2 = a2
 }
 
+func (lpf *Butterworth) ProcessSample(samples [][2]float64) {
+	for i := range samples {
+		x := samples[i][0]
+		y := lpf.b0*x + lpf.b1*lpf.x1 + lpf.b2*lpf.x2 - lpf.a1*lpf.y1 - lpf.a2*lpf.y2
+
+		lpf.x2 = lpf.x1
+		lpf.x1 = x
+		lpf.y2 = lpf.y1
+		lpf.y1 = y
+
+		samples[i][0] = y
+		samples[i][1] = y
+	}
+}
+
+func (lpf *Butterworth) GetSetter(k string) func(float64) {
+	fmt.Println("get setter on filter: ", k)
+	if k == "cutoff" {
+		return func(v float64) {
+			fmt.Println("cutoff to: ", v)
+			lpf.UpdateCutoff(v)
+		}
+	}
+	return nil
+
+}
+
 func (lpf *Butterworth) Process(src beep.Streamer) beep.Streamer {
 	return beep.StreamerFunc(func(samples [][2]float64) (n int, ok bool) {
 		n, ok = src.Stream(samples)
@@ -244,61 +308,117 @@ func (maf *MovingAverageFilter) Process(src beep.Streamer) beep.Streamer {
 	})
 }
 
-type Envelope struct {
+type Voice struct {
 	position int
-	delay    int
-	duration int
 	paused   bool
 
-	velocity float64
-
-	maxgain float64
-
 	sub beep.Streamer
+
+	envs []*PureEnv
 }
 
-func (e *Envelope) Err() error {
+func (e *Voice) Err() error {
 	return nil
 }
 
-func (e *Envelope) Start() {
+func (e *Voice) Start() {
 	e.paused = false
 }
 
-func (e *Envelope) Stop() {
+func (e *Voice) Stop() {
 	e.paused = true
+	for _, pe := range e.envs {
+		pe.Stop()
+	}
 }
 
-func (e *Envelope) Stream(samples [][2]float64) (int, bool) {
+func (e *Voice) Silent() bool {
+	if !e.paused {
+		return false
+	}
+
+	for _, env := range e.envs {
+		if !env.Done() {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (e *Voice) Stream(samples [][2]float64) (int, bool) {
+	if e.Silent() {
+		return 0, false
+	}
+
 	n, ok := e.sub.Stream(samples)
 	if !ok {
 		return n, ok
 	}
-
-	for i := range samples {
-		if e.paused {
-			e.velocity -= (e.maxgain / float64(e.delay))
-			if e.velocity < 0 {
-				e.velocity = 0
-			}
-		} else {
-			e.velocity += (e.maxgain / float64(e.delay))
-			if e.velocity > e.maxgain {
-				e.velocity = e.maxgain
-			}
-		}
-
-		samples[i][0] *= e.velocity
-		samples[i][1] *= e.velocity
-
-		/*
-			if samples[i][0] > 1 || samples[i][0] < -1 {
-				fmt.Println("too loud!", samples[i][0])
-			}
-		*/
-		e.position++
-	}
 	return n, ok
+}
+
+func (v *Voice) GetSetter(k string) func(float64) {
+	sable, ok := v.sub.(Settable)
+	if !ok {
+		return nil
+	}
+
+	return sable.GetSetter(k)
+}
+
+/*
+. Peak
+.  /\ Dropoff
+. /  ----\
+./        \ Decay
+____________________________________
+*/
+type PureEnv struct {
+	Max     float64
+	Peak    int
+	Dropoff int
+	Plateau float64
+	Tail    int
+
+	Released   *int
+	LastPos    int
+	ReleaseVal float64
+}
+
+func (e *PureEnv) Stop() {
+	e.ReleaseVal = e.getVal(e.LastPos)
+	relv := e.LastPos
+	e.Released = &relv
+}
+
+func (e *PureEnv) Done() bool {
+	return e.Released != nil && e.LastPos > *e.Released+e.Tail
+}
+
+func (e *PureEnv) GetVal(pos int) float64 {
+	e.LastPos = pos
+
+	return e.getVal(pos)
+}
+
+func (e *PureEnv) getVal(pos int) float64 {
+	if e.Released != nil {
+		past := pos - *e.Released
+		if past > e.Tail {
+			return 0
+		}
+		return e.ReleaseVal * (1 - float64(past)/float64(e.Tail))
+	}
+
+	if pos < e.Peak {
+		return e.Max * float64(pos) / float64(e.Peak)
+	}
+	if pos < e.Peak+e.Dropoff {
+		return e.Max + ((float64(pos-e.Peak) / float64(e.Dropoff)) * (e.Plateau - e.Max))
+	}
+
+	return e.Plateau
 }
 
 type FMWave struct {
@@ -307,6 +427,7 @@ type FMWave struct {
 	position   int
 	amplitude  float64
 	mfreq      float64
+	mfreqmod   float64
 	impact     float64
 
 	cwfunc OscFunc
@@ -316,19 +437,10 @@ type FMWave struct {
 func (sw *FMWave) Stream(samples [][2]float64) (n int, ok bool) {
 	for i := range samples {
 
-		// test
-		//_, phase := math.Modf(float64(sw.position) * sw.frequency / sw.sampleRate)
-
-		// Generate the sawtooth wave sample
-		//sample := 2*phase - 1
-
-		sample := sw.fmfunc(calcPhase(sw.position, sw.sampleRate, sw.mfreq))
-
-		//
-
-		//value := math.Sin(2 * math.Pi * float64(pos) / samplerate * freq)
+		sample := sw.fmfunc(calcPhase(sw.position, sw.sampleRate, sw.mfreq*sw.mfreqmod))
 
 		value := sw.cwfunc(calcPhase(sw.position, sampleRate, sw.frequency) + (sw.impact * sample))
+
 		samples[i][0] = value * sw.amplitude
 		samples[i][1] = value * sw.amplitude
 		sw.position++
@@ -338,6 +450,21 @@ func (sw *FMWave) Stream(samples [][2]float64) (n int, ok bool) {
 
 func (sw *FMWave) Err() error {
 	return nil
+}
+
+func (sw *FMWave) GetSetter(k string) func(float64) {
+	switch k {
+	case "mfreq":
+		return func(v float64) {
+			sw.mfreq = v
+		}
+	case "mfreqmod":
+		return func(v float64) {
+			sw.mfreqmod = v
+		}
+	default:
+		return nil
+	}
 }
 
 type SineWave struct {
@@ -366,6 +493,66 @@ func (sw *SineWave) Stream(samples [][2]float64) (n int, ok bool) {
 }
 
 func (sw *SineWave) Err() error {
+	return nil
+}
+
+type WeirdSine struct {
+	sampleRate   float64
+	frequency    float64
+	freqEnv      *PureEnv
+	position     int
+	amplitude    float64
+	amplitudeEnv *PureEnv
+	freqMod      float64
+	fmDecay      float64
+}
+
+func (sw *WeirdSine) GetSetter(k string) func(float64) {
+	switch k {
+	case "freqMod":
+		return func(v float64) {
+			sw.freqMod = v
+		}
+	case "fmDecay":
+		return func(v float64) {
+			sw.fmDecay = v
+		}
+	case "amp":
+		return func(v float64) {
+			fmt.Println("setting aplitude: ", v)
+			sw.amplitude = v
+		}
+	default:
+		fmt.Println("unknown setting: ", k)
+		return nil
+	}
+}
+
+func (sw *WeirdSine) Stream(samples [][2]float64) (n int, ok bool) {
+	//fmt.Println("weird sine: ", sw.amplitudeEnv.GetVal(sw.position))
+	for i := range samples {
+		freq := sw.frequency
+		if sw.freqEnv != nil {
+			freq *= sw.freqEnv.GetVal(sw.position)
+		}
+
+		value := sineOsc(calcPhase(sw.position, sw.sampleRate, freq+(rand.Float64()*sw.freqMod)))
+		amp := sw.amplitude
+		if sw.amplitudeEnv != nil {
+			amp *= sw.amplitudeEnv.GetVal(sw.position)
+		}
+
+		samples[i][0] = value * amp
+		samples[i][1] = value * amp
+		sw.position++
+		if sw.freqMod > 0 {
+			//sw.freqMod -= sw.fmDecay
+		}
+	}
+	return len(samples), true
+}
+
+func (sw *WeirdSine) Err() error {
 	return nil
 }
 
@@ -454,8 +641,176 @@ func softSquareOsc(pos int, sampleRate, freq float64) float64 {
 	return value
 }
 
-type Controller struct {
-	voices map[int64]*Envelope
+type Noise struct {
+	amplitude float64
+}
+
+func (nw *Noise) Stream(samples [][2]float64) (n int, ok bool) {
+	for i := range samples {
+		val := rand.Float64()
+		samples[i][0] = val * nw.amplitude
+		samples[i][1] = val * nw.amplitude
+	}
+	return len(samples), true
+}
+
+func (nw *Noise) Err() error {
+	return nil
+}
+
+type NoiseWave struct {
+	amplitude  float64
+	frequency  float64
+	position   int
+	sampleRate float64
+}
+
+func (nw *NoiseWave) Stream(samples [][2]float64) (n int, ok bool) {
+	for i := range samples {
+		value := sineOsc(calcPhase(nw.position, nw.sampleRate, nw.frequency))
+		val := (1 - (2 * rand.Float64())) * value
+		samples[i][0] = val * nw.amplitude
+		samples[i][1] = val * nw.amplitude
+		nw.position++
+	}
+	return len(samples), true
+}
+
+func (nw *NoiseWave) Err() error {
+	return nil
+}
+
+type Instrument struct {
+	newVoice func(note int64) *Voice
+
+	activeLk sync.Mutex
+	active   []*Voice
+
+	filter Filter
+
+	tmp [512][2]float64
+}
+
+func (i *Instrument) GetSetter(k string) func(float64) {
+	parts := strings.Split(k, ".")
+	sub := strings.Join(parts[1:], ".")
+	switch parts[0] {
+	case "voice":
+		// TODO: could do this more efficiently by storing the fact
+		// that we have a setter for a given value, and pulling that
+		// from every new voice when we create it
+		return func(v float64) {
+			for _, act := range i.active {
+				ss := act.GetSetter(sub)
+				if ss != nil {
+					ss(v)
+				}
+			}
+		}
+	case "filter":
+		return i.filter.GetSetter(sub)
+	default:
+		return nil
+	}
+
+}
+
+func (i *Instrument) Play(note int64) func() {
+	nv := i.newVoice(note)
+
+	i.activeLk.Lock()
+	defer i.activeLk.Unlock()
+
+	i.active = append(i.active, nv)
+	nv.Start()
+
+	return nv.Stop
+}
+
+func (i *Instrument) Stream(samples [][2]float64) (int, bool) {
+	i.activeLk.Lock()
+	defer i.activeLk.Unlock()
+
+	osamples := samples
+
+	for i := range samples {
+		samples[i] = [2]float64{}
+	}
+
+	if len(i.active) == 0 {
+		return len(samples), true
+	}
+
+	/*
+
+		var voices []beep.Streamer
+		for _, act := range i.active {
+			voices = append(voices, act)
+		}
+
+		n, _ := beep.Mix(voices...).Stream(samples)
+		return n, true
+	*/
+
+	rem := make(map[int]bool)
+	for len(samples) > 0 && len(rem) < len(i.active) {
+		toStream := len(i.tmp)
+		if toStream > len(samples) {
+			toStream = len(samples)
+		}
+
+		// clear the samples
+		for i := range samples[:toStream] {
+			samples[i] = [2]float64{}
+		}
+
+		for ix, st := range i.active {
+			// mix the stream
+			sn, ok := st.Stream(i.tmp[:toStream])
+			if !ok {
+				rem[ix] = true
+			}
+
+			if sn > 0 {
+				//fmt.Println("temp values", sn, i.tmp[0])
+			}
+			for iv := range i.tmp[:sn] {
+				samples[iv][0] += i.tmp[iv][0]
+				samples[iv][1] += i.tmp[iv][1]
+			}
+		}
+
+		samples = samples[toStream:]
+	}
+
+	var curs int
+	for ix := 0; ix < len(i.active); ix++ {
+		if rem[ix] {
+			continue
+		}
+
+		i.active[curs] = i.active[ix]
+		curs++
+	}
+	i.active = i.active[:curs]
+
+	if i.filter != nil {
+		i.filter.ProcessSample(osamples)
+	}
+
+	return len(osamples), true
+}
+
+func (i *Instrument) Err() error {
+	return nil
+}
+
+type Stack struct {
+	inst *Instrument
+
+	instruments []*Instrument
+
+	streamer beep.Streamer
 
 	filter *Butterworth
 
@@ -464,51 +819,68 @@ type Controller struct {
 	delay *Delay
 
 	sr beep.SampleRate
+
+	lk sync.Mutex
+
+	activeNotes map[int64]func()
 }
 
-func (c *Controller) StartNote(note int64) {
-	v, ok := c.voices[note]
+func (c *Stack) AddInstrument(inst *Instrument) {
+	c.instruments = append(c.instruments, inst)
+}
+
+func (c *Stack) StartNote(note int64) {
+	c.lk.Lock()
+	defer c.lk.Unlock()
+
+	oldstop, ok := c.activeNotes[note]
+	if ok {
+		fmt.Println("play called with active note")
+		oldstop()
+	}
+
+	stopf := c.inst.Play(note)
+
+	c.activeNotes[note] = stopf
+}
+
+func (c *Stack) StopNote(note int64) {
+	c.lk.Lock()
+	defer c.lk.Unlock()
+
+	stopf, ok := c.activeNotes[note]
 	if !ok {
-		v = c.newVoice(note)
-		c.voices[note] = v
+		return
 	}
 
-	v.Start()
+	stopf()
+	delete(c.activeNotes, note)
 }
 
-func (c *Controller) StopNote(note int64) {
-	v := c.voices[note]
-	v.Stop()
-}
+func (c *Stack) Stream(samples [][2]float64) (int, bool) {
 
-func (c *Controller) Stream(samples [][2]float64) (int, bool) {
-	if len(c.voices) == 0 {
-		for i := range samples {
-			samples[i][0] = 0
-			samples[i][1] = 0
+	if c.streamer == nil {
+		var streamers []beep.Streamer
+		for _, i := range c.instruments {
+			streamers = append(streamers, i)
 		}
-		return len(samples), true
+
+		c.streamer = beep.Mix(streamers...)
+		//c.streamer = c.filter.Process(c.streamer)
+		//out = c.delay.Process(out)
+
+		c.recorder.sub = c.streamer
 	}
 
-	var streams []beep.Streamer
-	for _, v := range c.voices {
-		streams = append(streams, v)
-	}
-
-	mixed := beep.Mix(streams...)
-	mixed = c.filter.Process(mixed)
-	//mixed = c.delay.Process(mixed)
-
-	c.recorder.sub = mixed
-
-	return c.recorder.Stream(samples)
+	n, ok := c.recorder.Stream(samples)
+	return n, ok
 }
 
-func (c *Controller) Err() error {
+func (c *Stack) Err() error {
 	return nil
 }
 
-func setupController(sr beep.SampleRate) *Controller {
+func setupStack(sr beep.SampleRate) *Stack {
 	/*
 		f := &LowPassFilter{
 			cutoffFreq: 200,
@@ -516,7 +888,7 @@ func setupController(sr beep.SampleRate) *Controller {
 		}
 		f.UpdateCutoff(500)
 	*/
-	f := NewButterworth(1000, sampleRate)
+	f := NewButterworth(2000, sampleRate)
 
 	n := sr.N(time.Millisecond * 50)
 	delay := &Delay{
@@ -529,20 +901,57 @@ func setupController(sr beep.SampleRate) *Controller {
 		buf: make([][2]float64, 10000),
 	}
 
-	return &Controller{
-		voices:   make(map[int64]*Envelope),
-		filter:   f,
-		recorder: recorder,
-		delay:    delay,
-		sr:       sr,
+	c := &Stack{
+		inst:        &Instrument{newVoice: newVoice},
+		filter:      f,
+		recorder:    recorder,
+		delay:       delay,
+		sr:          sr,
+		activeNotes: make(map[int64]func()),
+	}
+
+	c.AddInstrument(c.inst)
+	return c
+}
+
+func kickDrum(note int64) *Voice {
+
+	pitchEnv := &PureEnv{
+		Max:     0.5,
+		Peak:    0,
+		Dropoff: sr.N(time.Millisecond * 50),
+		Plateau: 0.05,
+		Tail:    0,
+	}
+
+	volEnv := &PureEnv{
+		Max:     1,
+		Peak:    0,
+		Dropoff: sr.N(time.Millisecond * 100),
+		Plateau: 0,
+	}
+
+	out := &WeirdSine{
+		sampleRate:   sampleRate,
+		amplitude:    0.5,
+		freqMod:      0,
+		frequency:    440 * math.Pow(2, (float64(note)-69)/12),
+		freqEnv:      pitchEnv,
+		amplitudeEnv: volEnv,
+	}
+
+	return &Voice{
+		sub:    out,
+		paused: true,
+		envs:   []*PureEnv{pitchEnv, volEnv},
 	}
 }
 
-func (c *Controller) newVoice(note int64) *Envelope {
+func newVoice(note int64) *Voice {
 	sine := &SineWave{sampleRate: sampleRate, amplitude: 0.3}
-	square := &SquareWave{sampleRate: sampleRate, amplitude: 0.3}
 	sine.frequency = 220 * math.Pow(2, (float64(note)-69)/12)
-	square.frequency = 880 * math.Pow(2, (float64(note)-69)/12)
+	square := &SquareWave{sampleRate: sampleRate, amplitude: 0.3}
+	square.frequency = 880 * math.Pow(2, (float64(note)-69)/12) * 4
 	square2 := &SquareWave{sampleRate: sampleRate, amplitude: 0.3}
 	square2.frequency = 220 * math.Pow(2, (float64(note)-69)/12)
 	sw := &SawWave{sampleRate: sampleRate, amplitude: 0.3}
@@ -550,19 +959,12 @@ func (c *Controller) newVoice(note int64) *Envelope {
 
 	mix := beep.Mix(sine, square, square2, sw)
 
-	_ = mix
-	//mix = c.filter.Process(mix)
-
-	// TODO: delay needs to go over the envelope
-
-	//maf := NewMovingAverageFilter(20)
-	//mix = maf.Process(mix)
-
 	fwm := &FMWave{
 		sampleRate: sampleRate,
 		amplitude:  0.3,
 		frequency:  440 * math.Pow(2, (float64(note)-69)/12),
 		mfreq:      440 * math.Pow(2, (float64(note)-69)/12),
+		mfreqmod:   1,
 		impact:     2,
 		fmfunc:     sineOsc,
 		cwfunc:     sawOsc,
@@ -570,60 +972,130 @@ func (c *Controller) newVoice(note int64) *Envelope {
 
 	fwm2 := &FMWave{
 		sampleRate: sampleRate,
-		amplitude:  0.3,
-		frequency:  220 * math.Pow(2, (float64(note)-69)/12),
-		mfreq:      440 * math.Pow(2, (float64(note)-69)/12),
-		impact:     6,
+		amplitude:  0.4,
+		frequency:  440 * math.Pow(2, (float64(note)-69)/12),
+		mfreq:      55 * math.Pow(2, (float64(note)-69)/12),
+		mfreqmod:   1,
+		impact:     0.1,
 		fmfunc:     sineOsc,
 		cwfunc:     sineOsc,
 	}
 
-	mix = beep.Mix(fwm, fwm2, sine)
-	mix = square2
+	noise := &NoiseWave{
+		amplitude:  0.06,
+		frequency:  440 * math.Pow(2, (float64(note)-69)/12),
+		sampleRate: sampleRate,
+	}
+	mix = beep.Mix(fwm, fwm2, sine, noise)
+	mix = beep.Mix(fwm2, sine, noise)
 
-	//out = c.filter.Process(out)
+	sine1 := &WeirdSine{sampleRate: sampleRate, amplitude: 0.3, freqMod: 0}
+	sine1.frequency = 220 * math.Pow(2, (float64(note)-69)/12)
+	sine2 := &WeirdSine{sampleRate: sampleRate, amplitude: 0.5, freqMod: 0}
+	sine2.frequency = 219.99 * math.Pow(2, (float64(note)-69)/12)
+	sine3 := &WeirdSine{sampleRate: sampleRate, amplitude: 0.2, freqMod: 0.8, fmDecay: 1 / float64(sr.N(time.Second*7))}
+	sine3.frequency = 220 * math.Pow(2, (float64(note)-69)/12)
+	sine7 := &WeirdSine{sampleRate: sampleRate, amplitude: 0.2, freqMod: 1, fmDecay: 1 / float64(sr.N(time.Second))}
+	sine7.frequency = 220 * math.Pow(2, (float64(note)-69)/12)
+	sine4 := &SineWave{sampleRate: sampleRate, amplitude: 0.1}
+	sine4.frequency = 440.1 * math.Pow(2, (float64(note)-69)/12)
+	sine5 := &SineWave{sampleRate: sampleRate, amplitude: 0.08}
+	sine5.frequency = 879.998 * math.Pow(2, (float64(note)-69)/12)
+	sine6 := &SineWave{sampleRate: sampleRate, amplitude: 0.05}
+	sine6.frequency = 2 * 880.01 * math.Pow(2, (float64(note)-69)/12)
+
+	mix = beep.Mix(sine1, sine2, sine3, sine4, sine5, sine6, sine7)
+
+	/*
+		sine1 := &SineWave{sampleRate: sampleRate, amplitude: 0.3}
+		sine1.frequency = 220 * math.Pow(2, (float64(note)-69)/12)
+		sine2 := &SineWave{sampleRate: sampleRate, amplitude: 0.3}
+		sine2.frequency = 440 * math.Pow(2, (float64(note)-69)/12)
+		sine3 := &SineWave{sampleRate: sampleRate, amplitude: 0.3}
+		sine3.frequency = 880 * math.Pow(2, (float64(note)-69)/12)
+
+		mix = beep.Mix(sine1, sine2, sine3, noise)
+	*/
+
 	//out = sw
 
-	return &Envelope{
-		delay: c.sr.N(time.Second / 50),
-		sub:   mix,
+	saw := &SawWave{sampleRate: sampleRate, amplitude: 0.05}
+	saw.frequency = 2 * 880.01 * math.Pow(2, (float64(note)-69)/12)
+	mix = saw
+
+	penv := &PureEnv{
+		Max:     0.5,
+		Peak:    0,
+		Dropoff: sr.N(time.Millisecond * 50),
+		Plateau: 0.3,
+		Tail:    sr.N(time.Millisecond * 50),
+	}
+
+	sine2.amplitudeEnv = penv
+
+	mix = beep.Mix(fwm, fwm2, sine, noise)
+
+	mix = MulMix(sine, square)
+
+	mix = saw
+	return &Voice{
+		sub: mix,
 		//sub:     mix,
-		paused:  true,
-		maxgain: 0.3,
+		paused: true,
+		//envs:   []*PureEnv{penv},
 	}
 }
 
 func playTestNotes() {
 	sr := beep.SampleRate(sampleRate)
-	speaker.Init(sr, sr.N(time.Second/10))
+	speaker.Init(sr, sr.N(time.Second/20))
 
 	done := make(chan bool)
 
-	controller := setupController(sr)
+	controller := setupStack(sr)
 
 	speaker.Play(beep.Seq(controller, beep.Callback(func() {
 		fmt.Println("DONE")
 		done <- true
 	})))
 
-	//controller.StartNote(60)
-	//time.Sleep(time.Millisecond * 100)
-	//controller.StopNote(60)
-	//time.Sleep(time.Second * 3)
+	script := []string{
+		`vf = func(note) {
+			freq = ntf(note)
+			sw = sine(freq, 1)
+			return newVoice(sw)
+		}`,
+		`ins = makeinst(vf)`,
+		`mc = getMidi()`,
+		`mc.SetInst(ins)`,
+		//`a = makearp(ins, 2, [60,62,65,68])`,
+		//`a.Run()`,
+	}
 
-	controller.StartNote(60)
-	time.Sleep(time.Millisecond * 50)
-	controller.StartNote(64)
-	time.Sleep(time.Millisecond * 50)
-	controller.StartNote(69)
-	time.Sleep(time.Second * 2)
-	controller.StopNote(60)
-	controller.StopNote(64)
-	controller.StopNote(69)
-	time.Sleep(time.Millisecond * 500)
+	system := NewSystem(controller)
+
+	for _, c := range script {
+		if err := system.ProcessCmd(c); err != nil {
+			fmt.Println("ERROR: ", err)
+		}
+	}
+
+	time.Sleep(time.Second * 10)
 }
 
 func main() {
+	pfi, err := os.Create("cpu.prof")
+	if err != nil {
+		panic(err)
+	}
+	pprof.StartCPUProfile(pfi)
+	go func() {
+		time.Sleep(time.Second * 15)
+		fmt.Println("writing profile...")
+		pprof.StopCPUProfile()
+		pfi.Close()
+
+	}()
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "test":
@@ -637,53 +1109,38 @@ func main() {
 	portmidi.Initialize()
 	defer portmidi.Terminate()
 
-	in, err := portmidi.NewInputStream(portmidi.DefaultInputDeviceID(), 1024)
+	fmt.Println("device info: ", portmidi.Info(portmidi.DefaultInputDeviceID()))
+
+	mc, err := OpenController(portmidi.DefaultInputDeviceID())
 	if err != nil {
 		panic(err)
 	}
-	defer in.Close()
 
 	sr := beep.SampleRate(sampleRate)
-	speaker.Init(sr, sr.N(time.Second/10))
+	speaker.Init(sr, sr.N(time.Second/20))
 
 	done := make(chan bool)
 
-	controller := setupController(sr)
+	controller := setupStack(sr)
+
+	mc.Target = controller.inst
+
+	filter := NewButterworth(3000, sampleRate)
+	mc.Target.filter = filter
+
+	mc.BindKnob(70, mc.Target.GetSetter("voice.mfreqmod"), func(in int64) float64 {
+		//return 55 * math.Pow(2, float64(in)/24)
+		return math.Pow((float64(in)/127)+0.5, 5)
+	})
+	mc.BindKnob(71, mc.Target.GetSetter("filter.cutoff"), func(in int64) float64 {
+		// for some reason the filter breaks if we set it above 22k
+		return 1000 * (float64(in) / 127)
+	})
 
 	speaker.Play(beep.Seq(controller, beep.Callback(func() {
 		fmt.Println("DONE")
 		done <- true
 	})))
-
-	for {
-		events, err := in.Read(1024)
-		if err != nil {
-			panic(err)
-		}
-
-		for _, event := range events {
-			switch event.Status {
-			case 0x90:
-				note := int64(event.Data1)
-				controller.StartNote(note)
-			case 0x80:
-				note := int64(event.Data1)
-				controller.StopNote(note)
-			case 0xb0:
-				// twisty knobs
-
-				//controller.filter.UpdateCutoff(10000 * (float64(event.Data2) / 128))
-				controller.filter.UpdateCutoff(math.Pow(float64(event.Data2), 1.5))
-
-			default:
-				b, err := json.Marshal(event)
-				if err != nil {
-					panic(err)
-				}
-				fmt.Println(string(b))
-			}
-		}
-	}
 
 	<-done
 }
@@ -729,171 +1186,4 @@ func checkSmooth(vals [][2]float64) {
 		}
 		cur = vals[i][0]
 	}
-}
-
-type Arp struct {
-	notes    []int64
-	duration time.Duration
-
-	c *Controller
-}
-
-func (a *Arp) Run() {
-	for {
-		for i := 0; i < len(a.notes); i++ {
-			a.c.StartNote(a.notes[i])
-			time.Sleep(a.duration)
-			a.c.StopNote(a.notes[i])
-		}
-	}
-}
-
-func draw() {
-	// Initialize SDL
-	if err := sdl.Init(sdl.INIT_EVERYTHING); err != nil {
-		fmt.Println("Failed to initialize SDL:", err)
-		os.Exit(1)
-	}
-	defer sdl.Quit()
-
-	// Create the window
-	window, err := sdl.CreateWindow("Graph", sdl.WINDOWPOS_UNDEFINED, sdl.WINDOWPOS_UNDEFINED, screenWidth, screenHeight, sdl.WINDOW_SHOWN)
-	if err != nil {
-		fmt.Println("Failed to create window:", err)
-		os.Exit(1)
-	}
-	defer window.Destroy()
-
-	// Create the renderer
-	renderer, err := sdl.CreateRenderer(window, -1, sdl.RENDERER_ACCELERATED)
-	if err != nil {
-		fmt.Println("Failed to create renderer:", err)
-		os.Exit(1)
-	}
-	defer renderer.Destroy()
-
-	sr := beep.SampleRate(sampleRate)
-	c := setupController(sr)
-
-	speaker.Init(sr, sr.N(time.Second/20))
-
-	speaker.Play(beep.Seq(c, beep.Callback(func() {
-		fmt.Println("DONE")
-	})))
-
-	buf := make([][2]float64, 2000)
-
-	keystates := make(map[int]bool)
-	dataPoints := make([]float64, len(buf))
-
-	a := &Arp{
-		notes:    []int64{60, 64, 67, 72},
-		duration: time.Millisecond * 400,
-		c:        c,
-	}
-
-	go a.Run()
-
-	// Game loop
-	running := true
-	var octaveAdjust int64
-	for running {
-		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
-			switch event := event.(type) {
-			case *sdl.QuitEvent:
-				running = false
-			case *sdl.KeyboardEvent:
-				var note int64
-				switch event.Keysym.Sym {
-				case sdl.K_a:
-					note = 60
-				case sdl.K_s:
-					note = 62
-				case sdl.K_d:
-					note = 64
-				case sdl.K_f:
-					note = 65
-				case sdl.K_g:
-					note = 67
-				case sdl.K_h:
-					note = 69
-				case sdl.K_j:
-					note = 71
-				case sdl.K_k:
-					note = 72
-				case sdl.K_l:
-					note = 74
-				}
-				note += octaveAdjust
-
-				if event.Type == sdl.KEYUP {
-					v := int(event.Keysym.Sym)
-					if keystates[v] {
-						delete(keystates, int(event.Keysym.Sym))
-						if note > 0 {
-							c.StopNote(note)
-						} else {
-							switch v {
-							case sdl.K_z:
-								octaveAdjust -= 12
-							case sdl.K_x:
-								octaveAdjust += 12
-							}
-						}
-					}
-				} else if event.Type == sdl.KEYDOWN {
-					if keystates[int(event.Keysym.Sym)] {
-						continue
-					}
-					keystates[int(event.Keysym.Sym)] = true
-					if note > 0 {
-						c.StartNote(note)
-					}
-				}
-			}
-		}
-
-		c.recorder.GetSnapshot(buf)
-		for i, v := range buf {
-			dataPoints[i] = v[0]
-		}
-
-		fftResult := fft.FFTReal(dataPoints)
-
-		// Get the magnitude spectrum
-		magnitudeSpectrum := make([]float64, len(fftResult)/2+1)
-		for i, c := range fftResult[:len(magnitudeSpectrum)] {
-			magnitudeSpectrum[i] = cmplx.Abs(c) / float64(len(dataPoints))
-		}
-
-		// Clear the renderer
-		renderer.SetDrawColor(255, 255, 255, 255)
-		renderer.Clear()
-
-		graphData(renderer, dataPoints[:500], 50, 50, 600, 200, -1, 1)
-		graphData(renderer, magnitudeSpectrum[:100], 50, 300, 600, 200, 0, 0.5)
-
-		// Present the renderer
-		renderer.Present()
-	}
-}
-
-func graphData(renderer *sdl.Renderer, dataPoints []float64, x, y, width, height int32, minval, maxval float64) {
-	// Draw the graph axes
-	renderer.SetDrawColor(0, 0, 0, 255)
-	renderer.DrawLine(x, y+height/2, x+width, y+height/2)
-	renderer.DrawLine(x, y, x, y+height)
-
-	spread := maxval - minval
-	// Draw the data points
-	renderer.SetDrawColor(255, 0, 0, 255)
-	for i := 0; i < len(dataPoints)-1; i++ {
-		x1 := x + int32(float64(i)*float64(width)/float64(len(dataPoints)-1))
-		y1 := y + height - int32((float64(dataPoints[i]-minval)/maxval)*float64(height)/spread)
-		x2 := x + int32(float64(i+1)*float64(width)/float64(len(dataPoints)-1))
-		//y2 := y + height/2 - int32(dataPoints[i+1]*float64(height)/4)
-		y2 := y + height - int32((float64(dataPoints[i+1]-minval)/maxval)*float64(height)/spread)
-		renderer.DrawLine(x1, y1, x2, y2)
-	}
-
 }
