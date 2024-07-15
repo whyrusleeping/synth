@@ -91,7 +91,6 @@ func (mc *MidiController) run() {
 
 				kb, ok := mc.knobBinds[event.Data1]
 				if ok {
-					fmt.Println("updating...", event.Data2)
 					kb.Update(event.Data2)
 				}
 

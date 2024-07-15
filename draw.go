@@ -67,6 +67,7 @@ func draw() {
 	}
 
 	go func() {
+		return
 		for {
 			t := prompt.Input("> ", completer)
 			if t == "exit" {
@@ -138,7 +139,10 @@ func draw() {
 			}
 		}
 
-		c.recorder.GetSnapshot(buf)
+		if len(keystates) > 0 {
+			c.recorder.GetSnapshot(buf)
+		}
+
 		for i, v := range buf {
 			dataPoints[i] = v[0]
 		}

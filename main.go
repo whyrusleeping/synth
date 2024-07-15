@@ -24,7 +24,7 @@ const (
 
 var sr = beep.SampleRate(sampleRate)
 
-type Filter interface {
+type Effect interface {
 	ProcessSample(samples [][2]float64)
 	GetSetter(k string) func(float64)
 }
@@ -35,6 +35,33 @@ type Recorder struct {
 	position int
 
 	sub beep.Streamer
+}
+
+type EffectsStack struct {
+	names   []string
+	effects []Effect
+}
+
+func (es *EffectsStack) ProcessSample(samples [][2]float64) {
+	for _, e := range es.effects {
+		e.ProcessSample(samples)
+	}
+}
+
+func (es *EffectsStack) AddEffect(name string, effect Effect) {
+	es.names = append(es.names, name)
+	es.effects = append(es.effects, effect)
+}
+
+func (es *EffectsStack) GetSetter(k string) func(float64) {
+	parts := strings.Split(k, ".")
+	sub := strings.Join(parts[1:], ".")
+	for i, n := range es.names {
+		if parts[0] == n {
+			return es.effects[i].GetSetter(sub)
+		}
+	}
+	return nil
 }
 
 func (r *Recorder) Stream(samples [][2]float64) (int, bool) {
@@ -112,35 +139,106 @@ type Delay struct {
 	delay    int
 	decay    float64
 	position int
+
+	wpos int
+}
+
+func (d *Delay) GetSetter(k string) func(float64) {
+	switch k {
+	case "delay":
+		return func(v float64) {
+			d.delay = int(v)
+			fmt.Println("delay is: ", d.delay)
+		}
+	case "decay":
+		return func(v float64) {
+			d.decay = v
+		}
+
+	default:
+		return nil
+	}
+
+}
+
+func (d *Delay) ProcessSample(samples [][2]float64) {
+
+	/*
+		if d.delay != d.lastDelay {
+
+		}
+
+		odpos := (d.lastPosition + 1) % len(d.buf)
+		ndpos := (d.delay + d.position) % len(d.buf)
+		if odpos != ndpos {
+			// some sort of adjustment was made to the delay
+			// should probably do something fancy, but for now just repeat the last delay buffer value until we 'catch up'
+		}
+	*/
+
+	for i := range samples {
+		samples[i][0] += d.buf[d.position%len(d.buf)][0]
+		samples[i][1] += d.buf[d.position%len(d.buf)][1]
+
+		dpos := (d.delay + d.position)
+		wpos := d.wpos % len(d.buf)
+		d.buf[wpos][0] = samples[i][0] * d.decay
+		d.buf[wpos][1] = samples[i][1] * d.decay
+		if d.wpos < dpos {
+			d.wpos++
+			wpos = d.wpos % len(d.buf)
+			d.buf[wpos][0] = samples[i][0] * d.decay
+			d.buf[wpos][1] = samples[i][1] * d.decay
+		} else if d.wpos > dpos && dpos%3 == 0 {
+			d.wpos--
+		}
+
+		d.position++
+		d.wpos++
+	}
 }
 
 func (d *Delay) Process(src beep.Streamer) beep.Streamer {
 	return beep.StreamerFunc(func(samples [][2]float64) (n int, ok bool) {
 		n, ok = src.Stream(samples)
 
-		for i := range samples[:n] {
-			samples[i][0] += d.buf[d.position%len(d.buf)][0]
-			samples[i][1] += d.buf[d.position%len(d.buf)][1]
-
-			dpos := (d.delay + d.position) % len(d.buf)
-			d.buf[dpos][0] = samples[i][0] * d.decay
-			d.buf[dpos][1] = samples[i][1] * d.decay
-
-			/*
-				rv := rand.Intn(2)
-				for i := 0; i < 4; i++ {
-					dposr := (d.delay + d.position + rv - 3 + i) % len(d.buf)
-					d.buf[dposr][0] += samples[i][0] * d.decay * rand.Float64() * 0.1
-					d.buf[dposr][1] += samples[i][1] * d.decay * rand.Float64() * 0.1
-				}
-			*/
-
-			d.position++
-		}
+		d.ProcessSample(samples)
 
 		return n, ok
 	})
+}
 
+type LoudnessFixer struct {
+	thresh float64
+
+	mul float64
+
+	speed float64
+}
+
+func (lf *LoudnessFixer) GetSetter(k string) func(float64) {
+	return nil
+}
+
+func (lf *LoudnessFixer) ProcessSample(samples [][2]float64) {
+	var maxval float64
+	for _, v := range samples {
+		av := math.Abs(v[0])
+		if av > maxval {
+			maxval = av
+		}
+	}
+
+	for i := range samples {
+		if lf.mul*maxval < lf.thresh {
+			lf.mul *= lf.speed
+		} else if lf.mul*maxval > lf.thresh {
+			lf.mul /= lf.speed
+		}
+
+		samples[i][0] *= lf.mul
+		samples[i][1] *= lf.mul
+	}
 }
 
 type LowPassFilter struct {
@@ -180,11 +278,69 @@ func (lpf *LowPassFilter) ProcessSample(cur float64) float64 {
 	return math.Max(-1, math.Min(1, fv))
 }
 
+type SimpleLowPass struct {
+	sampleRate float64
+	Cutoff     float64
+	LastVal    float64
+}
+
+func (slp *SimpleLowPass) ProcessSample(samples [][2]float64) {
+	n := len(samples)
+	waveLength := float64(n) / slp.sampleRate
+	rc := 1.0 / (2 * math.Pi * slp.Cutoff)
+	alpha := waveLength / (rc + waveLength)
+	for i := range samples {
+		samples[i][0] = slp.LastVal + alpha*(samples[i][0]-slp.LastVal)
+		slp.LastVal = samples[i][0]
+		samples[i][1] = samples[i][0]
+	}
+}
+
+func (slp *SimpleLowPass) GetSetter(k string) func(float64) {
+	return nil
+}
+
+type Sweeper struct {
+	Action func(float64)
+	val    float64
+	dir    int
+}
+
+func (s *Sweeper) Run() {
+	for range time.Tick(time.Millisecond * 5) {
+		if s.dir == 0 {
+			s.val = 0
+			s.dir = 1
+		}
+
+		if s.dir > 0 {
+			s.val += 0.01
+		} else {
+			s.val -= 0.01
+		}
+
+		if s.val >= 1 {
+			s.val = 1
+			s.dir = -1
+		}
+		if s.val <= 0 {
+			s.val = 0
+			s.dir = 1
+		}
+
+		s.Action(s.val)
+	}
+}
+
 // butterworth filter
 type Butterworth struct {
 	b0, b1, b2, a1, a2 float64
 	x1, x2, y1, y2     float64
 	sampleRate         float64
+
+	position int
+
+	cutoffEnv *PureEnv
 }
 
 func NewButterworth(cutoffFreq, sampleRate float64) *Butterworth {
@@ -227,6 +383,11 @@ func (b *Butterworth) UpdateCutoff(cutoffFreq float64) {
 
 func (lpf *Butterworth) ProcessSample(samples [][2]float64) {
 	for i := range samples {
+		if lpf.cutoffEnv != nil {
+			v := lpf.cutoffEnv.GetVal(lpf.position)
+			lpf.UpdateCutoff(v)
+		}
+
 		x := samples[i][0]
 		y := lpf.b0*x + lpf.b1*lpf.x1 + lpf.b2*lpf.x2 - lpf.a1*lpf.y1 - lpf.a2*lpf.y2
 
@@ -237,6 +398,8 @@ func (lpf *Butterworth) ProcessSample(samples [][2]float64) {
 
 		samples[i][0] = y
 		samples[i][1] = y
+
+		lpf.position++
 	}
 }
 
@@ -244,7 +407,6 @@ func (lpf *Butterworth) GetSetter(k string) func(float64) {
 	fmt.Println("get setter on filter: ", k)
 	if k == "cutoff" {
 		return func(v float64) {
-			fmt.Println("cutoff to: ", v)
 			lpf.UpdateCutoff(v)
 		}
 	}
@@ -380,6 +542,7 @@ type PureEnv struct {
 	Dropoff int
 	Plateau float64
 	Tail    int
+	End     float64
 
 	Released   *int
 	LastPos    int
@@ -406,9 +569,9 @@ func (e *PureEnv) getVal(pos int) float64 {
 	if e.Released != nil {
 		past := pos - *e.Released
 		if past > e.Tail {
-			return 0
+			return e.End
 		}
-		return e.ReleaseVal * (1 - float64(past)/float64(e.Tail))
+		return e.ReleaseVal + ((float64(past) / float64(e.Tail)) * (e.End - e.ReleaseVal))
 	}
 
 	if pos < e.Peak {
@@ -563,6 +726,8 @@ type SawWave struct {
 	amplitude  float64
 
 	phase float64
+
+	bow float64
 }
 
 func sawOsc(ph float64) float64 {
@@ -589,11 +754,28 @@ func (sw *SawWave) Stream(samples [][2]float64) (n int, ok bool) {
 		// Generate the sawtooth wave sample
 		sample := 2*sw.phase - 1
 
+		if sw.bow > 0 {
+			bowadj := 1 - math.Pow(1-sw.phase, 2)
+			sample += bowadj
+		}
+
 		// Update the output samples
-		samples[i][0] = sample
-		samples[i][1] = sample
+		samples[i][0] = sample * sw.amplitude
+		samples[i][1] = sample * sw.amplitude
 	}
 	return len(samples), true
+}
+
+func (sw *SawWave) GetSetter(k string) func(float64) {
+	switch k {
+	case "bow":
+		return func(v float64) {
+			fmt.Println("bow set to: ", v)
+			sw.bow = v
+		}
+	default:
+		return nil
+	}
 }
 
 func (sw *SawWave) Err() error {
@@ -686,7 +868,7 @@ type Instrument struct {
 	activeLk sync.Mutex
 	active   []*Voice
 
-	filter Filter
+	effect Effect
 
 	tmp [512][2]float64
 }
@@ -707,10 +889,8 @@ func (i *Instrument) GetSetter(k string) func(float64) {
 				}
 			}
 		}
-	case "filter":
-		return i.filter.GetSetter(sub)
 	default:
-		return nil
+		return i.effect.GetSetter(k)
 	}
 
 }
@@ -738,6 +918,9 @@ func (i *Instrument) Stream(samples [][2]float64) (int, bool) {
 	}
 
 	if len(i.active) == 0 {
+		if i.effect != nil {
+			i.effect.ProcessSample(osamples)
+		}
 		return len(samples), true
 	}
 
@@ -794,8 +977,8 @@ func (i *Instrument) Stream(samples [][2]float64) (int, bool) {
 	}
 	i.active = i.active[:curs]
 
-	if i.filter != nil {
-		i.filter.ProcessSample(osamples)
+	if i.effect != nil {
+		i.effect.ProcessSample(osamples)
 	}
 
 	return len(osamples), true
@@ -892,7 +1075,7 @@ func setupStack(sr beep.SampleRate) *Stack {
 
 	n := sr.N(time.Millisecond * 50)
 	delay := &Delay{
-		buf:   make([][2]float64, n*2),
+		buf:   make([][2]float64, n*10),
 		delay: n,
 		decay: 0.7,
 	}
@@ -902,7 +1085,7 @@ func setupStack(sr beep.SampleRate) *Stack {
 	}
 
 	c := &Stack{
-		inst:        &Instrument{newVoice: newVoice},
+		inst:        &Instrument{newVoice: wahSaw},
 		filter:      f,
 		recorder:    recorder,
 		delay:       delay,
@@ -944,6 +1127,36 @@ func kickDrum(note int64) *Voice {
 		sub:    out,
 		paused: true,
 		envs:   []*PureEnv{pitchEnv, volEnv},
+	}
+}
+
+func wahSaw(note int64) *Voice {
+	saw := &SawWave{sampleRate: sampleRate, amplitude: 0.2, bow: 0.9}
+	saw.frequency = 880 * math.Pow(2, (float64(note)-69)/12)
+
+	penv := &PureEnv{
+		Max:     saw.frequency * 1.5,
+		Peak:    sr.N(time.Millisecond * 100),
+		Dropoff: sr.N(time.Millisecond * 50),
+		Plateau: saw.frequency * 1,
+		Tail:    sr.N(time.Millisecond * 100),
+		End:     saw.frequency / 2,
+	}
+
+	filter := NewButterworth(saw.frequency*1.5, sampleRate)
+	filter.cutoffEnv = penv
+	_ = filter
+
+	var out beep.StreamerFunc = func(samples [][2]float64) (int, bool) {
+		n, ok := saw.Stream(samples)
+		//filter.ProcessSample(samples[:n])
+		return n, ok
+	}
+
+	return &Voice{
+		sub:    out,
+		paused: true,
+		//envs:   []*PureEnv{penv},
 	}
 }
 
@@ -1019,7 +1232,7 @@ func newVoice(note int64) *Voice {
 
 	//out = sw
 
-	saw := &SawWave{sampleRate: sampleRate, amplitude: 0.05}
+	saw := &SawWave{sampleRate: sampleRate, amplitude: 0.2, bow: 0.9}
 	saw.frequency = 2 * 880.01 * math.Pow(2, (float64(note)-69)/12)
 	mix = saw
 
@@ -1126,16 +1339,55 @@ func main() {
 	mc.Target = controller.inst
 
 	filter := NewButterworth(3000, sampleRate)
-	mc.Target.filter = filter
+	delaySamples := sr.N(time.Millisecond * 200)
+	delay := &Delay{
+		buf:   make([][2]float64, delaySamples*10),
+		delay: delaySamples,
+		decay: 0.7,
+	}
+
+	//compressor := NewCompressor(float64(sr), 15, 0.5, 0.1, 0.1, 0.5)
+
+	es := &EffectsStack{}
+	es.AddEffect("filter", filter)
+	es.AddEffect("delay", delay)
+	//es.AddEffect("compressor", compressor)
+
+	mc.Target.effect = es
 
 	mc.BindKnob(70, mc.Target.GetSetter("voice.mfreqmod"), func(in int64) float64 {
-		//return 55 * math.Pow(2, float64(in)/24)
 		return math.Pow((float64(in)/127)+0.5, 5)
 	})
 	mc.BindKnob(71, mc.Target.GetSetter("filter.cutoff"), func(in int64) float64 {
 		// for some reason the filter breaks if we set it above 22k
-		return 1000 * (float64(in) / 127)
+		return 100 + (1500 * (float64(in) / 127))
 	})
+
+	mc.BindKnob(74, mc.Target.GetSetter("delay.decay"), func(in int64) float64 {
+		return float64(in) / 127
+	})
+
+	mc.BindKnob(75, mc.Target.GetSetter("delay.delay"), func(in int64) float64 {
+		frac := float64(in) / 127
+		dur := time.Duration(float64(time.Second) * frac)
+		fmt.Println("delay N", dur)
+		return float64(sr.N(dur))
+	})
+	mc.BindKnob(76, mc.Target.GetSetter("voice.bow"), func(in int64) float64 {
+		frac := float64(in) / 127
+		return frac
+	})
+
+	fcutoff := mc.Target.GetSetter("filter.cutoff")
+	sweeper := &Sweeper{
+		Action: func(v float64) {
+			val := ((500 * v) + 200)
+			fcutoff(val)
+		},
+	}
+
+	_ = sweeper
+	//go sweeper.Run()
 
 	speaker.Play(beep.Seq(controller, beep.Callback(func() {
 		fmt.Println("DONE")
