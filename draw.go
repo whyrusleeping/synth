@@ -13,6 +13,15 @@ import (
 	"github.com/veandco/go-sdl2/sdl"
 )
 
+const (
+	screenWidth  = 1000
+	screenHeight = 600
+	graphWidth   = 800
+	graphHeight  = 400
+	graphOffsetX = 100
+	graphOffsetY = 100
+)
+
 func draw() {
 	// Initialize SDL
 	if err := sdl.Init(sdl.INIT_EVERYTHING); err != nil {
