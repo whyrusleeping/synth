@@ -556,11 +556,9 @@ func (e *Voice) Err() error {
 
 func (e *Voice) Start() {
 	e.paused = false
-	log.Println("start")
 }
 
 func (e *Voice) Stop() {
-	log.Println("stop")
 	e.paused = true
 	for _, pe := range e.envs {
 		pe.Stop()
@@ -578,14 +576,12 @@ func (e *Voice) Silent() bool {
 		}
 	}
 
-	log.Println("silent")
 	return true
 }
 
 func (e *Voice) Stream(samples [][2]float64) (int, bool) {
 	if e.Silent() {
 		if e.finalVal[0] != 0 {
-			fmt.Println("doing a fade")
 			fade := 50
 			if len(samples) < fade {
 				fade = len(samples)
@@ -1280,7 +1276,7 @@ func setupStack(sr beep.SampleRate) *Stack {
 	}
 
 	c := &Stack{
-		inst:        NewInstrument(wahSaw),
+		inst:        NewInstrument(moduNoise),
 		filter:      f,
 		recorder:    recorder,
 		delay:       delay,
@@ -1356,13 +1352,39 @@ func dirtySq(note int64) *Voice {
 	}
 }
 
+func moduNoise(note int64) *Voice {
+	noise := &Noise{amplitude: 200}
+
+	frequency := 440 * math.Pow(2, (float64(note)-69)/12)
+	filter := NewBandPass(sampleRate, frequency, 0.001)
+	//filter.cutoffEnv = penv
+
+	var out beep.StreamerFunc = func(samples [][2]float64) (int, bool) {
+		n, ok := noise.Stream(samples)
+		filter.ProcessSample(samples[:n])
+		return n, ok
+	}
+
+	return &Voice{
+		sub:    out,
+		paused: true,
+		//envs:   []*PureEnv{penv},
+	}
+}
+
 func wahSaw(note int64) *Voice {
 	saw := &SawWave{sampleRate: sampleRate, amplitude: 0.2, bow: 0}
 	saw.frequency = 880 * math.Pow(2, (float64(note)-69)/12)
 
+	saw2 := &SawWave{sampleRate: sampleRate, amplitude: 0.2, bow: 0.5}
+	saw2.frequency = 440 * math.Pow(2, (float64(note)-69)/12)
+
+	sub := &SineWave{sampleRate: sampleRate, amplitude: 0.2}
+	sub.frequency = 220 * math.Pow(2, (float64(note)-69)/12)
+
 	penv := &PureEnv{
 		Max:     saw.frequency * 1.5,
-		Peak:    sr.N(time.Millisecond * 100),
+		Peak:    sr.N(time.Millisecond * 50),
 		Dropoff: sr.N(time.Millisecond * 50),
 		Plateau: saw.frequency * 1,
 		Tail:    sr.N(time.Millisecond * 100),
@@ -1372,8 +1394,10 @@ func wahSaw(note int64) *Voice {
 	filter := NewBandPass(sampleRate, saw.frequency*1.5, sampleRate)
 	filter.cutoffEnv = penv
 
+	mix := beep.Mix(saw, saw2, sub)
+
 	var out beep.StreamerFunc = func(samples [][2]float64) (int, bool) {
-		n, ok := saw.Stream(samples)
+		n, ok := mix.Stream(samples)
 		filter.ProcessSample(samples[:n])
 		return n, ok
 	}
@@ -1521,6 +1545,12 @@ func playTestNotes() {
 	time.Sleep(time.Second * 10)
 }
 
+func linearMap(inmax int, low, hi float64) func(int64) float64 {
+	return func(v int64) float64 {
+		return low + ((hi - low) * (float64(v) / float64(inmax)))
+	}
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	pfi, err := os.Create("cpu.prof")
@@ -1564,7 +1594,7 @@ func main() {
 
 	mc.Target = controller.inst
 
-	filter := NewLowPass(3000, sampleRate)
+	filter := NewBandPass(sampleRate, 1000, 400)
 	delaySamples := sr.N(time.Millisecond * 200)
 	delay := &Delay{
 		buf:   make([][2]float64, delaySamples*10),
@@ -1584,10 +1614,8 @@ func main() {
 	mc.BindKnob(70, mc.Target.GetSetter("voice.mfreqmod"), func(in int64) float64 {
 		return math.Pow((float64(in)/127)+0.5, 5)
 	})
-	mc.BindKnob(71, mc.Target.GetSetter("filter.cutoff"), func(in int64) float64 {
-		// for some reason the filter breaks if we set it above 22k
-		return 100 + (1500 * (float64(in) / 127))
-	})
+	mc.BindKnob(71, mc.Target.GetSetter("filter.frequency"), linearMap(127, 100, 2000))
+	mc.BindKnob(72, mc.Target.GetSetter("filter.width"), linearMap(127, 0, 20))
 
 	mc.BindKnob(74, mc.Target.GetSetter("delay.decay"), func(in int64) float64 {
 		return float64(in) / 127
