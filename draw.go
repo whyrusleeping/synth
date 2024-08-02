@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/cmplx"
 	"os"
 	"time"
@@ -21,6 +22,95 @@ const (
 	graphOffsetX = 100
 	graphOffsetY = 100
 )
+
+func renderVis(stk *Stack) {
+	// Initialize SDL
+	if err := sdl.Init(sdl.INIT_EVERYTHING); err != nil {
+		fmt.Println("Failed to initialize SDL:", err)
+		os.Exit(1)
+	}
+	defer sdl.Quit()
+
+	// Create the window
+	window, err := sdl.CreateWindow("Graph", sdl.WINDOWPOS_UNDEFINED, sdl.WINDOWPOS_UNDEFINED, screenWidth, screenHeight, sdl.WINDOW_SHOWN)
+	if err != nil {
+		fmt.Println("Failed to create window:", err)
+		os.Exit(1)
+	}
+	defer window.Destroy()
+
+	// Create the renderer
+	renderer, err := sdl.CreateRenderer(window, -1, sdl.RENDERER_ACCELERATED)
+	if err != nil {
+		fmt.Println("Failed to create renderer:", err)
+		os.Exit(1)
+	}
+	defer renderer.Destroy()
+
+	buf := make([][2]float64, 2000)
+
+	dataPoints := make([]float64, len(buf))
+
+	running := true
+	for running {
+		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
+			switch event := event.(type) {
+			case *sdl.QuitEvent:
+				running = false
+				_ = event
+			}
+		}
+
+		stk.recorder.GetSnapshot(buf)
+
+		start := 0
+		minvi := 0
+		var minv float64 = 1
+		for i := range buf {
+			av := math.Abs(buf[i][0])
+			if av < minv {
+				minv = av
+				minvi = i
+			}
+			if av < 0.001 {
+				start = i
+				break
+			}
+		}
+
+		if start == 0 {
+			start = minvi
+		}
+
+		for i, v := range buf[start:] {
+			dataPoints[i] = v[0]
+		}
+
+		subs := dataPoints[:len(buf)-start]
+
+		fftResult := fft.FFTReal(subs)
+
+		// Get the magnitude spectrum
+		magnitudeSpectrum := make([]float64, len(fftResult)/2+1)
+		for i, c := range fftResult[:len(magnitudeSpectrum)] {
+			magnitudeSpectrum[i] = cmplx.Abs(c) / float64(len(dataPoints))
+		}
+
+		if len(magnitudeSpectrum) > 100 {
+			magnitudeSpectrum = magnitudeSpectrum[:len(magnitudeSpectrum)/2]
+		}
+
+		// Clear the renderer
+		renderer.SetDrawColor(255, 255, 255, 255)
+		renderer.Clear()
+
+		graphData(renderer, subs[:500], 50, 50, 600, 200, -1, 1)
+		graphData(renderer, magnitudeSpectrum, 50, 300, 600, 200, 0, 0.5)
+
+		// Present the renderer
+		renderer.Present()
+	}
+}
 
 func draw() {
 	// Initialize SDL
@@ -70,6 +160,8 @@ func draw() {
 	*/
 
 	sys := NewSystem(c)
+
+	mc := NewMockController()
 
 	completer := func(d prompt.Document) []prompt.Suggest {
 		return nil
@@ -126,7 +218,7 @@ func draw() {
 					if keystates[v] {
 						delete(keystates, int(event.Keysym.Sym))
 						if note > 0 {
-							c.StopNote(note)
+							mc.stopNote(note)
 						} else {
 							switch v {
 							case sdl.K_z:
@@ -142,7 +234,7 @@ func draw() {
 					}
 					keystates[int(event.Keysym.Sym)] = true
 					if note > 0 {
-						c.StartNote(note)
+						mc.startNote(note)
 					}
 				}
 			}

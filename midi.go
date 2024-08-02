@@ -51,6 +51,16 @@ func OpenController(id portmidi.DeviceID) (*MidiController, error) {
 	return mc, nil
 }
 
+func NewMockController() *MidiController {
+	mc := &MidiController{
+		noteStates: make(map[int64]func()),
+		knobsSeen:  make(map[int64]*knobInfo),
+		knobBinds:  make(map[int64]*knobBind),
+	}
+
+	return mc
+}
+
 func (mc *MidiController) Shutdown() {
 	mc.stream.Close()
 }
@@ -140,7 +150,7 @@ type Setter func(float64)
 
 func (mc *MidiController) BindKnob(knobid int64, s Setter, rangeMapFunc func(int64) float64) {
 	if s == nil {
-		fmt.Println("nil setter passed to bind knob")
+		fmt.Println("nil setter passed to bind knob: ", knobid)
 		return
 	}
 	mc.knobBinds[knobid] = &knobBind{

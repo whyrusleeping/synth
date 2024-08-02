@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"math/rand"
 	"time"
 )
 
@@ -48,7 +48,7 @@ func posToNote(pos int) int {
 }
 
 func (c *Clock) Run() {
-	barInterval := time.Minute / (time.Duration(c.BPM) * time.Duration(c.MinDiv) * 4)
+	barInterval := (4 * time.Minute) / (time.Duration(c.BPM) * time.Duration(c.MinDiv))
 
 	var pos int
 	for range time.Tick(barInterval) {
@@ -66,18 +66,33 @@ type Sequencer struct {
 	NoteSize int
 	Inst     *Instrument
 
+	corrupt bool
+	playing []bool
+
 	curnoteStop func()
 
 	cur int
 }
 
 func (s *Sequencer) Tick(notesize, pos int) {
+	if s.playing == nil {
+		s.playing = make([]bool, len(s.Notes))
+		for i := range s.playing {
+			s.playing[i] = true
+		}
+	}
 	if notesize <= s.NoteSize {
-		fmt.Println("tick: ", notesize, pos)
+		if s.corrupt && rand.Intn(4) == 0 {
+			ix := rand.Intn(len(s.playing))
+			s.playing[ix] = !s.playing[ix]
+		}
 		if s.curnoteStop != nil {
 			s.curnoteStop()
 		}
-		//s.curnoteStop = s.Inst.Play(s.Notes[s.cur%len(s.Notes)])
+		ni := s.cur % len(s.Notes)
+		if s.playing[ni] {
+			s.curnoteStop = s.Inst.Play(s.Notes[ni])
+		}
 		s.cur++
 	}
 }

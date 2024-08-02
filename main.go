@@ -209,98 +209,6 @@ func (d *Delay) Process(src beep.Streamer) beep.Streamer {
 	})
 }
 
-type LoudnessFixer struct {
-	thresh float64
-
-	mul float64
-
-	speed float64
-}
-
-func (lf *LoudnessFixer) GetSetter(k string) func(float64) {
-	return nil
-}
-
-func (lf *LoudnessFixer) ProcessSample(samples [][2]float64) {
-	var maxval float64
-	for _, v := range samples {
-		av := math.Abs(v[0])
-		if av > maxval {
-			maxval = av
-		}
-	}
-
-	for i := range samples {
-		if lf.mul*maxval < lf.thresh {
-			lf.mul *= lf.speed
-		} else if lf.mul*maxval > lf.thresh {
-			lf.mul /= lf.speed
-		}
-
-		samples[i][0] *= lf.mul
-		samples[i][1] *= lf.mul
-	}
-}
-
-type LowPassFilter struct {
-	prevRaw      float64
-	prevFiltered float64
-
-	cutoffFreq float64
-	sampleRate float64
-	alpha      float64
-}
-
-func (lpf *LowPassFilter) Process(src beep.Streamer) beep.Streamer {
-	return beep.StreamerFunc(func(samples [][2]float64) (n int, ok bool) {
-		n, ok = src.Stream(samples)
-
-		for i := range samples[:n] {
-			nv := lpf.ProcessSample(samples[i][0])
-			lpf.prevRaw = samples[i][0]
-			lpf.prevFiltered = nv
-			samples[i][0] = nv
-			samples[i][1] = nv
-		}
-
-		return n, ok
-	})
-}
-
-func (lpf *LowPassFilter) UpdateCutoff(cutoff float64) {
-	lpf.cutoffFreq = cutoff
-	rc := 1.0 / (2 * math.Pi * lpf.cutoffFreq)
-	dt := 1.0 / lpf.sampleRate
-	lpf.alpha = dt / (rc + dt)
-}
-
-func (lpf *LowPassFilter) ProcessSample(cur float64) float64 {
-	fv := lpf.alpha*cur + (1-lpf.alpha)*lpf.prevFiltered
-	return math.Max(-1, math.Min(1, fv))
-}
-
-type SimpleLowPass struct {
-	sampleRate float64
-	Cutoff     float64
-	LastVal    float64
-}
-
-func (slp *SimpleLowPass) ProcessSample(samples [][2]float64) {
-	n := len(samples)
-	waveLength := float64(n) / slp.sampleRate
-	rc := 1.0 / (2 * math.Pi * slp.Cutoff)
-	alpha := waveLength / (rc + waveLength)
-	for i := range samples {
-		samples[i][0] = slp.LastVal + alpha*(samples[i][0]-slp.LastVal)
-		slp.LastVal = samples[i][0]
-		samples[i][1] = samples[i][0]
-	}
-}
-
-func (slp *SimpleLowPass) GetSetter(k string) func(float64) {
-	return nil
-}
-
 type Sweeper struct {
 	Action func(float64)
 	val    float64
@@ -346,7 +254,8 @@ type Butterworth struct {
 	frequency float64
 	width     float64
 
-	cutoffEnv *PureEnv
+	frequencyEnv *PureEnv
+	widthEnv     *PureEnv
 }
 
 const (
@@ -435,9 +344,26 @@ func (b *Butterworth) UpdateBandpass(frequency, width float64) {
 
 func (lpf *Butterworth) ProcessSample(samples [][2]float64) {
 	for i := range samples {
-		if lpf.cutoffEnv != nil {
-			v := lpf.cutoffEnv.GetVal(lpf.position)
-			lpf.UpdateCutoff(v)
+		switch lpf.mode {
+		case ModeLowPass:
+			if lpf.frequencyEnv != nil {
+				v := lpf.frequencyEnv.GetVal(lpf.position)
+				lpf.UpdateCutoff(v)
+			}
+		case ModeBandPass:
+			if lpf.frequencyEnv != nil || lpf.widthEnv != nil {
+				freq := lpf.frequency
+				if lpf.frequencyEnv != nil {
+					freq = lpf.frequencyEnv.GetVal(lpf.position)
+				}
+
+				width := lpf.width
+				if lpf.widthEnv != nil {
+					width = lpf.widthEnv.GetVal(lpf.position)
+				}
+
+				lpf.UpdateBandpass(freq, width)
+			}
 		}
 
 		x := samples[i][0]
@@ -621,9 +547,10 @@ func (v *Voice) GetSetter(k string) func(float64) {
 .  /\ Dropoff
 . /  ----\
 ./        \ Decay
-____________________________________
+Zero____________________________________
 */
 type PureEnv struct {
+	Zero    float64
 	Max     float64
 	Peak    int
 	Dropoff int
@@ -662,7 +589,8 @@ func (e *PureEnv) getVal(pos int) float64 {
 	}
 
 	if pos < e.Peak {
-		return e.Max * float64(pos) / float64(e.Peak)
+		rnge := e.Max - e.Zero
+		return e.Zero + (rnge * float64(pos) / float64(e.Peak))
 	}
 	if pos < e.Peak+e.Dropoff {
 		return e.Max + ((float64(pos-e.Peak) / float64(e.Dropoff)) * (e.Plateau - e.Max))
@@ -721,7 +649,29 @@ type WaveFolder struct {
 	thresh float64
 }
 
+func threshInvert(thr, v float64) float64 {
+	if v > thr {
+		return thr - (v - thr)
+	}
+	if v < -1*thr {
+		return (-1 * thr) - (v + thr)
+	}
+	return v
+}
+
+func threshSqrt(thr, v float64) float64 {
+	if v > thr {
+		return thr + math.Sqrt(v-thr)
+	}
+	if v < -1*thr {
+		return (-1 * thr) - math.Sqrt(-1*(v+thr))
+	}
+	return v
+}
+
 func (wf *WaveFolder) processVal(v float64) float64 {
+	//ov := threshSqrt(wf.thresh, v)
+	//return ov
 	if v > wf.thresh {
 		return wf.thresh - (v - wf.thresh)
 	}
@@ -738,6 +688,18 @@ func (wf *WaveFolder) ProcessSample(samples [][2]float64) {
 		samples[i][0] = v
 		samples[i][1] = v
 	}
+}
+
+func (wf *WaveFolder) GetSetter(k string) func(float64) {
+	switch k {
+	case "threshold":
+		return func(v float64) {
+			wf.thresh = v
+		}
+	default:
+		return nil
+	}
+
 }
 
 type SineWave struct {
@@ -850,6 +812,8 @@ type SawWave struct {
 	phase float64
 
 	bow float64
+
+	amplitudeEnv *PureEnv
 }
 
 func sawOsc(ph float64) float64 {
@@ -868,10 +832,11 @@ func (sw *SawWave) Stream(samples [][2]float64) (n int, ok bool) {
 			sw.position++
 		}
 	*/
+	period := sw.sampleRate / sw.frequency
 
 	for i := range samples {
 		// Calculate the current phase
-		_, sw.phase = math.Modf(sw.phase + sw.frequency/sw.sampleRate)
+		_, sw.phase = math.Modf(float64(sw.position) / period)
 
 		// Generate the sawtooth wave sample
 		sample := 2*sw.phase - 1
@@ -881,9 +846,15 @@ func (sw *SawWave) Stream(samples [][2]float64) (n int, ok bool) {
 			sample += bowadj
 		}
 
+		amp := sw.amplitude
+		if sw.amplitudeEnv != nil {
+			amp = sw.amplitudeEnv.GetVal(sw.position)
+		}
+
 		// Update the output samples
-		samples[i][0] = sample * sw.amplitude
-		samples[i][1] = sample * sw.amplitude
+		samples[i][0] = sample * amp
+		samples[i][1] = sample * amp
+		sw.position++
 	}
 	return len(samples), true
 }
@@ -909,6 +880,7 @@ type DirtySquare struct {
 	frequency  float64
 	position   int
 	amplitude  float64
+	dip        float64
 
 	median float64
 }
@@ -918,6 +890,10 @@ func (sw *DirtySquare) GetSetter(k string) func(float64) {
 	case "median":
 		return func(v float64) {
 			sw.median = v
+		}
+	case "dip":
+		return func(v float64) {
+			sw.dip = v
 		}
 	default:
 		return nil
@@ -931,9 +907,9 @@ func (sw *DirtySquare) Stream(samples [][2]float64) (n int, ok bool) {
 		phase := math.Mod(float64(sw.position), period)
 		var value float64
 		if phase < period*sw.median {
-			value = 1
+			value = 1 - (sw.dip * phase)
 		} else {
-			value = -1
+			value = -1 + (sw.dip * phase)
 		}
 		samples[i][0] = value * sw.amplitude
 		samples[i][1] = value * sw.amplitude
@@ -989,13 +965,20 @@ func softSquareOsc(pos int, sampleRate, freq float64) float64 {
 
 type Noise struct {
 	amplitude float64
+	ampEnv    *PureEnv
+	position  int
 }
 
 func (nw *Noise) Stream(samples [][2]float64) (n int, ok bool) {
 	for i := range samples {
+		amp := nw.amplitude
+		if nw.ampEnv != nil {
+			amp = nw.ampEnv.GetVal(nw.position)
+		}
 		val := rand.Float64()
-		samples[i][0] = val * nw.amplitude
-		samples[i][1] = val * nw.amplitude
+		samples[i][0] = val * amp
+		samples[i][1] = val * amp
+		nw.position++
 	}
 	return len(samples), true
 }
@@ -1039,6 +1022,8 @@ type Instrument struct {
 	tmp [512][2]float64
 
 	done bool
+
+	controllerBind func(*Instrument, *MidiController) error
 }
 
 func NewInstrument(vf func(int64) *Voice) *Instrument {
@@ -1046,6 +1031,14 @@ func NewInstrument(vf func(int64) *Voice) *Instrument {
 		newVoice:  vf,
 		voiceVals: make(map[string]float64),
 	}
+}
+
+func (i *Instrument) Bind(mc *MidiController) error {
+	if i.controllerBind == nil {
+		mc.SetInst(i)
+		return nil
+	}
+	return i.controllerBind(i, mc)
 }
 
 func (i *Instrument) GetSetter(k string) func(float64) {
@@ -1084,6 +1077,7 @@ func (i *Instrument) Play(note int64) func() {
 		sf := nv.GetSetter(k)
 		if sf == nil {
 			fmt.Println("no val for: ", k)
+			continue
 		}
 		sf(v)
 	}
@@ -1180,7 +1174,7 @@ func (i *Instrument) Err() error {
 }
 
 type Stack struct {
-	inst *Instrument
+	//inst *Instrument
 
 	instruments []*Instrument
 
@@ -1190,7 +1184,7 @@ type Stack struct {
 
 	recorder *Recorder
 
-	delay *Delay
+	//delay *Delay2
 
 	sr beep.SampleRate
 
@@ -1201,34 +1195,6 @@ type Stack struct {
 
 func (c *Stack) AddInstrument(inst *Instrument) {
 	c.instruments = append(c.instruments, inst)
-}
-
-func (c *Stack) StartNote(note int64) {
-	c.lk.Lock()
-	defer c.lk.Unlock()
-
-	oldstop, ok := c.activeNotes[note]
-	if ok {
-		fmt.Println("play called with active note")
-		oldstop()
-	}
-
-	stopf := c.inst.Play(note)
-
-	c.activeNotes[note] = stopf
-}
-
-func (c *Stack) StopNote(note int64) {
-	c.lk.Lock()
-	defer c.lk.Unlock()
-
-	stopf, ok := c.activeNotes[note]
-	if !ok {
-		return
-	}
-
-	stopf()
-	delete(c.activeNotes, note)
 }
 
 func (c *Stack) Stream(samples [][2]float64) (int, bool) {
@@ -1264,28 +1230,77 @@ func setupStack(sr beep.SampleRate) *Stack {
 	*/
 	f := NewLowPass(2000, sampleRate)
 
-	n := sr.N(time.Millisecond * 50)
-	delay := &Delay{
-		buf:   make([][2]float64, n*10),
-		delay: n,
-		decay: 0.7,
-	}
-
 	recorder := &Recorder{
 		buf: make([][2]float64, 10000),
 	}
 
 	c := &Stack{
-		inst:        NewInstrument(moduNoise),
-		filter:      f,
-		recorder:    recorder,
-		delay:       delay,
+		filter:   f,
+		recorder: recorder,
+		//delay:       delay,
 		sr:          sr,
 		activeNotes: make(map[int64]func()),
 	}
 
-	c.AddInstrument(c.inst)
 	return c
+}
+
+type AmpControl struct {
+	env      *PureEnv
+	position int
+}
+
+func (ac *AmpControl) GetSetter(k string) func(float64) {
+	return nil
+}
+
+func (ac *AmpControl) ProcessSample(samples [][2]float64) {
+	for i := range samples {
+		v := ac.env.GetVal(ac.position)
+		samples[i][0] *= v
+		samples[i][1] *= v
+		ac.position++
+	}
+}
+
+func snareDrum(note int64) *Voice {
+	frequency := 880 * math.Pow(2, (float64(note)-69)/12)
+	cenv := &PureEnv{
+		Max:     frequency,
+		Dropoff: sr.N(time.Millisecond * 100),
+		Plateau: 0.0001,
+	}
+
+	lpf := NewLowPass(frequency, sampleRate)
+	lpf.frequencyEnv = cenv
+
+	ampEnv := &PureEnv{
+		Max:     1,
+		Dropoff: sr.N(time.Millisecond * 100),
+		Plateau: 0,
+		Tail:    0,
+	}
+
+	out := &Noise{
+		amplitude: 1,
+	}
+
+	ac := &AmpControl{
+		env: ampEnv,
+	}
+	es := &EffectsStack{}
+	es.AddEffect("lowpass", lpf)
+	es.AddEffect("amp", ac)
+
+	ew := &EffectWrap{
+		sub:    out,
+		effect: es,
+	}
+	return &Voice{
+		sub:    ew,
+		paused: true,
+		envs:   []*PureEnv{cenv, ampEnv},
+	}
 }
 
 func kickDrum(note int64) *Voice {
@@ -1307,7 +1322,7 @@ func kickDrum(note int64) *Voice {
 
 	out := &WeirdSine{
 		sampleRate:   sampleRate,
-		amplitude:    0.5,
+		amplitude:    1,
 		freqMod:      0,
 		frequency:    440 * math.Pow(2, (float64(note)-69)/12),
 		freqEnv:      pitchEnv,
@@ -1321,29 +1336,93 @@ func kickDrum(note int64) *Voice {
 	}
 }
 
+type EffectWrap struct {
+	sub    beep.Streamer
+	effect Effect
+}
+
+func (ew *EffectWrap) Stream(samples [][2]float64) (int, bool) {
+	n, ok := ew.sub.Stream(samples)
+	ew.effect.ProcessSample(samples[:n])
+	return n, ok
+}
+
+func (ew *EffectWrap) Err() error {
+	return nil
+}
+
+func (ew *EffectWrap) GetSetter(k string) func(float64) {
+	ss, ok := ew.sub.(Settable)
+	if ok {
+		val := ss.GetSetter(k)
+		if val != nil {
+			return val
+		}
+	}
+
+	return ew.effect.GetSetter(k)
+}
+
 func dirtySq(note int64) *Voice {
 	sq := &DirtySquare{
 		sampleRate: sampleRate,
-		amplitude:  0.2,
+		amplitude:  0.1,
 		median:     0.2,
 		frequency:  440 * math.Pow(2, (float64(note)-69)/12),
 	}
 
+	return &Voice{
+		sub:    sq,
+		paused: true,
+		//envs:   []*PureEnv{penv},
+	}
+}
+
+func freqModBasic(note int64) *Voice {
+	fwm := &FMWave{
+		sampleRate: sampleRate,
+		amplitude:  0.3,
+		frequency:  440 * math.Pow(2, (float64(note)-69)/12),
+		mfreq:      440 * math.Pow(2, (float64(note)-69)/12),
+		mfreqmod:   1,
+		impact:     2,
+		fmfunc:     sineOsc,
+		cwfunc:     sawOsc,
+	}
+
+	return &Voice{
+		sub:    fwm,
+		paused: true,
+		//envs:   []*PureEnv{penv},
+	}
+}
+
+func normalSine(note int64) *Voice {
+	sw := &SineWave{
+		sampleRate: sampleRate,
+		amplitude:  0.3,
+		frequency:  440 * math.Pow(2, (float64(note)-69)/12),
+	}
+
+	return &Voice{
+		sub:    sw,
+		paused: true,
+		//envs:   []*PureEnv{penv},
+	}
+}
+
+func foldedSine(note int64) *Voice {
 	sw := &SineWave{
 		sampleRate: sampleRate,
 		amplitude:  0.99,
 		frequency:  440 * math.Pow(2, (float64(note)-69)/12),
 	}
 
-	wf := *&WaveFolder{thresh: 0.6}
+	wf := &WaveFolder{thresh: 0.6}
 
-	_ = sq
-	_ = wf
-
-	var out beep.StreamerFunc = func(samples [][2]float64) (int, bool) {
-		n, ok := sw.Stream(samples)
-		wf.ProcessSample(samples[:n])
-		return n, ok
+	out := &EffectWrap{
+		sub:    sw,
+		effect: wf,
 	}
 	return &Voice{
 		sub:    out,
@@ -1357,7 +1436,7 @@ func moduNoise(note int64) *Voice {
 
 	frequency := 440 * math.Pow(2, (float64(note)-69)/12)
 	filter := NewBandPass(sampleRate, frequency, 0.001)
-	//filter.cutoffEnv = penv
+	//filter.frequencyEnv = penv
 
 	var out beep.StreamerFunc = func(samples [][2]float64) (int, bool) {
 		n, ok := noise.Stream(samples)
@@ -1384,7 +1463,7 @@ func wahSaw(note int64) *Voice {
 
 	penv := &PureEnv{
 		Max:     saw.frequency * 1.5,
-		Peak:    sr.N(time.Millisecond * 50),
+		Peak:    sr.N(time.Millisecond * 150),
 		Dropoff: sr.N(time.Millisecond * 50),
 		Plateau: saw.frequency * 1,
 		Tail:    sr.N(time.Millisecond * 100),
@@ -1392,7 +1471,7 @@ func wahSaw(note int64) *Voice {
 	}
 
 	filter := NewBandPass(sampleRate, saw.frequency*1.5, sampleRate)
-	filter.cutoffEnv = penv
+	filter.frequencyEnv = penv
 
 	mix := beep.Mix(saw, saw2, sub)
 
@@ -1563,7 +1642,6 @@ func main() {
 		fmt.Println("writing profile...")
 		pprof.StopCPUProfile()
 		pfi.Close()
-
 	}()
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -1592,63 +1670,237 @@ func main() {
 
 	controller := setupStack(sr)
 
-	mc.Target = controller.inst
+	//inst := NewDirtySquare()
+	//inst := NewWahSaw()
 
-	filter := NewBandPass(sampleRate, 1000, 400)
-	delaySamples := sr.N(time.Millisecond * 200)
-	delay := &Delay{
-		buf:   make([][2]float64, delaySamples*10),
-		delay: delaySamples,
-		decay: 0.7,
+	inst := NewSpicySaw()
+	inst.Bind(mc)
+	controller.AddInstrument(inst)
+
+	/*
+		fcutoff := inst.GetSetter("filter.cutoff")
+		sweeper := &Sweeper{
+			Action: func(v float64) {
+				val := ((500 * v) + 200)
+				fcutoff(val)
+			},
+		}
+
+		_ = sweeper
+		//go sweeper.Run()
+	*/
+
+	kick := NewInstrument(kickDrum)
+	snare := NewInstrument(snareDrum)
+	controller.AddInstrument(kick)
+	controller.AddInstrument(snare)
+
+	clk := NewClock(110, 32)
+
+	seq := &Sequencer{
+		Notes:    []int64{60, 63, 67, 71},
+		NoteSize: 16,
+		Inst:     mc.Target,
+		corrupt:  true,
 	}
-
-	//compressor := NewCompressor(float64(sr), 15, 0.5, 0.1, 0.1, 0.5)
-
-	es := &EffectsStack{}
-	es.AddEffect("filter", filter)
-	es.AddEffect("delay", delay)
-	//es.AddEffect("compressor", compressor)
-
-	mc.Target.effect = es
-
-	mc.BindKnob(70, mc.Target.GetSetter("voice.mfreqmod"), func(in int64) float64 {
-		return math.Pow((float64(in)/127)+0.5, 5)
-	})
-	mc.BindKnob(71, mc.Target.GetSetter("filter.frequency"), linearMap(127, 100, 2000))
-	mc.BindKnob(72, mc.Target.GetSetter("filter.width"), linearMap(127, 0, 20))
-
-	mc.BindKnob(74, mc.Target.GetSetter("delay.decay"), func(in int64) float64 {
-		return float64(in) / 127
-	})
-
-	mc.BindKnob(75, mc.Target.GetSetter("delay.delay"), func(in int64) float64 {
-		frac := float64(in) / 127
-		dur := time.Duration(float64(time.Second) * frac)
-		fmt.Println("delay N", dur)
-		return float64(sr.N(dur))
-	})
-	mc.BindKnob(76, mc.Target.GetSetter("voice.median"), func(in int64) float64 {
-		frac := float64(in) / 127
-		return frac
-	})
-
-	fcutoff := mc.Target.GetSetter("filter.cutoff")
-	sweeper := &Sweeper{
-		Action: func(v float64) {
-			val := ((500 * v) + 200)
-			fcutoff(val)
-		},
+	kickseq := &Sequencer{
+		Notes:    []int64{60, 0},
+		NoteSize: 4,
+		Inst:     kick,
 	}
+	snareseq := &Sequencer{
+		Notes:    []int64{0, 80},
+		NoteSize: 4,
+		Inst:     snare,
+	}
+	clk.Sequences = append(clk.Sequences, seq, kickseq, snareseq)
 
-	_ = sweeper
-	//go sweeper.Run()
+	//go clk.Run()
 
 	speaker.Play(beep.Seq(controller, beep.Callback(func() {
 		fmt.Println("DONE")
 		done <- true
 	})))
 
-	<-done
+	renderVis(controller)
+}
+
+func attempt1(note int64) *Voice {
+	saw := &SawWave{sampleRate: sampleRate, amplitude: 0.5, bow: 0}
+	saw.frequency = 440 * math.Pow(2, (float64(note)-69)/12)
+
+	volEnv := &PureEnv{
+		Max:     0.3,
+		Peak:    sr.N(time.Millisecond * 50),
+		Dropoff: sr.N(time.Millisecond * 50),
+		Plateau: 0.25,
+		Tail:    sr.N(time.Millisecond * 100),
+	}
+
+	widthEnv := &PureEnv{
+		Zero:    0,
+		Max:     0.3,
+		Peak:    sr.N(time.Millisecond * 100),
+		Dropoff: sr.N(time.Millisecond * 2000),
+		Plateau: 0.4,
+		Tail:    sr.N(time.Millisecond * 100),
+		End:     0.2,
+	}
+
+	saw.amplitudeEnv = volEnv
+
+	filter := NewBandPass(sampleRate, saw.frequency*2, 4)
+	filter.widthEnv = widthEnv
+
+	wf := &WaveFolder{thresh: 0.25}
+
+	es := &EffectsStack{}
+	es.AddEffect("folder", wf)
+	es.AddEffect("filter", filter)
+	_ = filter
+	ew := &EffectWrap{
+		sub:    saw,
+		effect: es,
+	}
+
+	return &Voice{
+		sub:    ew,
+		paused: true,
+		envs: []*PureEnv{
+			widthEnv,
+			volEnv,
+		},
+	}
+}
+
+func NewSpicySaw() *Instrument {
+	inst := NewInstrument(attempt1)
+	//filter := NewBandPass(sampleRate, 1000, 400)
+	//filter := NewLowPass(1000, sampleRate)
+
+	delay := NewDelay2(time.Millisecond*50, 0)
+	des := &EffectsStack{}
+	des.AddEffect("lp", NewLowPass(200, sampleRate))
+	delay.bufEffect = des
+
+	compressor := NewCompressor(0.5, 1.1, 0.005, 0.0002)
+
+	lpf := NewLowPass(200, sampleRate)
+	es := &EffectsStack{}
+	es.AddEffect("delay", delay)
+	es.AddEffect("filter", lpf)
+	es.AddEffect("compressor", compressor)
+
+	inst.effect = es
+	inst.controllerBind = func(inst *Instrument, mc *MidiController) error {
+		mc.Target = inst
+		mc.BindKnob(71, inst.GetSetter("filter.frequency"), linearMap(127, 100, 2000))
+		mc.BindKnob(72, inst.GetSetter("filter.width"), linearMap(127, 0, 20))
+		mc.BindKnob(73, inst.GetSetter("filter.cutoff"), linearMap(127, 100, 2000))
+		mc.BindKnob(74, inst.GetSetter("delay.decay"), func(in int64) float64 {
+			return float64(in) / 127
+		})
+
+		mc.BindKnob(75, inst.GetSetter("delay.delay"), func(in int64) float64 {
+			frac := float64(in) / 127
+			dur := time.Duration(float64(time.Second) * frac)
+			fmt.Println("delay N", dur)
+			return float64(sr.N(dur))
+		})
+		mc.BindKnob(76, inst.GetSetter("voice.folder.threshold"), linearMap(127, 0, 0.5))
+		return nil
+	}
+	return inst
+}
+
+func NewWahSaw() *Instrument {
+	inst := NewInstrument(wahSaw)
+	//filter := NewBandPass(sampleRate, 1000, 400)
+	filter := NewLowPass(1000, sampleRate)
+	delay := NewDelay2(time.Millisecond*50, 0.3)
+	des := &EffectsStack{}
+	des.AddEffect("lp", NewLowPass(200, sampleRate))
+	delay.bufEffect = des
+
+	compressor := NewCompressor(0.5, 1.1, 0.001, 0.0001)
+
+	es := &EffectsStack{}
+	es.AddEffect("filter", filter)
+	es.AddEffect("delay", delay)
+	es.AddEffect("compressor", compressor)
+
+	inst.effect = es
+	inst.controllerBind = func(inst *Instrument, mc *MidiController) error {
+		mc.Target = inst
+		mc.BindKnob(71, inst.GetSetter("filter.frequency"), linearMap(127, 100, 2000))
+		mc.BindKnob(72, inst.GetSetter("filter.width"), linearMap(127, 0, 20))
+		mc.BindKnob(73, inst.GetSetter("filter.cutoff"), linearMap(127, 100, 2000))
+		mc.BindKnob(74, inst.GetSetter("delay.decay"), func(in int64) float64 {
+			return float64(in) / 127
+		})
+
+		mc.BindKnob(75, inst.GetSetter("delay.delay"), func(in int64) float64 {
+			frac := float64(in) / 127
+			dur := time.Duration(float64(time.Second) * frac)
+			fmt.Println("delay N", dur)
+			return float64(sr.N(dur))
+		})
+		return nil
+	}
+	return inst
+}
+
+func NewDirtySquare() *Instrument {
+	inst := NewInstrument(dirtySq)
+	//filter := NewBandPass(sampleRate, 1000, 400)
+	filter := NewLowPass(1000, sampleRate)
+	delay := NewDelay2(time.Millisecond*50, 0.3)
+	//des := &EffectsStack{}
+	//des.AddEffect("lp", NewLowPass(200, sampleRate))
+	//delay.bufEffect = des
+
+	compressor := NewCompressor(0.5, 1.1, 0.001, 0.0001)
+
+	es := &EffectsStack{}
+	es.AddEffect("filter", filter)
+	es.AddEffect("delay", delay)
+	es.AddEffect("compressor", compressor)
+
+	inst.effect = es
+	inst.controllerBind = func(inst *Instrument, mc *MidiController) error {
+		mc.Target = inst
+		mc.BindKnob(70, inst.GetSetter("voice.mfreqmod"), func(in int64) float64 {
+			return math.Pow((float64(in)/127)+0.5, 5)
+		})
+		mc.BindKnob(71, inst.GetSetter("filter.frequency"), linearMap(127, 100, 2000))
+		mc.BindKnob(72, inst.GetSetter("filter.width"), linearMap(127, 0, 20))
+		mc.BindKnob(73, inst.GetSetter("filter.cutoff"), linearMap(127, 100, 2000))
+
+		mc.BindKnob(74, inst.GetSetter("delay.decay"), func(in int64) float64 {
+			return float64(in) / 127
+		})
+
+		mc.BindKnob(75, inst.GetSetter("delay.delay"), func(in int64) float64 {
+			frac := float64(in) / 127
+			dur := time.Duration(float64(time.Second) * frac)
+			fmt.Println("delay N", dur)
+			return float64(sr.N(dur))
+		})
+		mc.BindKnob(76, inst.GetSetter("voice.threshold"), func(in int64) float64 {
+			frac := float64(in) / 127
+			return frac
+		})
+		mc.BindKnob(76, inst.GetSetter("voice.median"), func(in int64) float64 {
+			frac := float64(in) / 127
+			return frac
+		})
+		mc.BindKnob(77, inst.GetSetter("voice.dip"), func(in int64) float64 {
+			frac := float64(in) / 127
+			return (frac - 0.5) / 50
+		})
+		return nil
+	}
+	return inst
 }
 
 var vals = []string{
